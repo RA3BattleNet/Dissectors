@@ -8,9 +8,6 @@ local tcp_stream_field = Field.new("tcp.stream")
 
 function PeerchatProtocol.init()
     peerchat_instances = {}
-    for k, v in ipairs(DissectorTable.list()) do
-        print(v)
-    end
 end
 
 function PeerchatProtocol.dissector(buffer, pinfo, tree)
