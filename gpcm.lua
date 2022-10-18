@@ -33,14 +33,14 @@ function GpcmProtocol.dissector(buffer, pinfo, tree)
 
     local current = current_direction.packets[pinfo.number]
     if not current then return end
+    pinfo.cols.protocol = GpcmProtocol.name
     if current.info:len() == 0 then
-        current.info = "GPCM Partial Data"
+        pinfo.columns.info = "GPCM Partial Data"
     else
-        info.columns.info = current.info
+        pinfo.columns.info = current.info
     end
     if not next(current.data) then return end
 
-    pinfo.cols.protocol = GpcmProtocol.name
     local t = tree:add(GpcmProtocol, buffer())
     for i, message in ipairs(current.data) do
         -- a slice from packet tvb
