@@ -269,6 +269,7 @@ local ResponseTypeToString = (function()
     for k, v in pairs(ResponseType) do
         t[v] = k
     end
+    return t
 end)()
 
 function QueryMasterServerResponse:new()
