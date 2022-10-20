@@ -693,13 +693,11 @@ function QueryMasterServerResponse:parse_server_body(context)
                         -- need more data
                         return nil
                     end
-                    print(('%s -> %s'):format(key.key_name, string))
                     context:push_data(key.key_name, key.key_name, string, type_name)
                     context:advance_unparsed(string:len() + 1)
                 else
                     -- lua table is 1 based
                     local string = self.popular_values[popular_index + 1]
-                    print(('%s -> (popular) %s'):format(key.key_name, string))
                     context:push_data(key.key_name, key.key_name, string, type_name)
                 end
             end
