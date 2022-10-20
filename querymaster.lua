@@ -54,14 +54,14 @@ local dissector = function(buffer, pinfo, tree)
     if current.is_from_server then
         packet_tvb_range = current.raw:tvb('Raw Data')()
     end
-    local t = tree:add(QueryMasterProtocol, packet_tvb_range)
-    for i, message in ipairs(current.data) do
+    function add_to_tree(prefix, t, message)
         -- try to create a field from message key
-        local field_key = ('%s.%s'):format(message.abbr, message.kind)
+        local full_abbr = ('%s.%s'):format(prefix, message.abbr)
+        local field_key = ('%s/%s'):format(full_abbr, message.kind)
         local field = QueryMasterProtocol.fields[field_key]
         if not field then
             -- create a new field
-            field = ProtoField[message.kind]("querymaster." .. message.abbr, message.key)
+            field = ProtoField[message.kind](full_abbr, message.key)
             QueryMasterProtocol.fields[field_key] = field
         end
 
@@ -72,7 +72,25 @@ local dissector = function(buffer, pinfo, tree)
             tvb_range = buffer(message.index, message.length)
         end
         -- add the field to the tree
-        t[message.action](t, field, tvb_range, text)
+        t[message.action or 'add'](t, field, tvb_range, text)
+    end
+    local t = tree:add(QueryMasterProtocol, packet_tvb_range)
+    for i, message in ipairs(current.data) do
+        add_to_tree('querymaster', t, message)
+    end
+    if next(current.servers or {}) then
+        for i, server_data in ipairs(current.servers) do
+            local subtree = t:add(QueryMasterProtocol, packet_tvb_range, 'Server')
+            for j, field in ipairs(server_data) do
+                add_to_tree('querymaster.server', subtree, field)
+            end
+        end
+    end
+    if next(current.ad_hoc_data or {}) then
+        local subtree = t:add(QueryMasterProtocol, packet_tvb_range, 'Ad Hoc Data')
+        for i, field in ipairs(current.ad_hoc_data) do
+            add_to_tree('querymaster.ad_hoc_data', subtree, field)
+        end
     end
 end
 
@@ -80,6 +98,11 @@ local bytearray_to_ip = function(bytearray)
     local a, b = bytearray:get_index(0), bytearray:get_index(1)
     local c, d = bytearray:get_index(2), bytearray:get_index(3)
     return Address.ip(('%d.%d.%d.%d'):format(a, b, c, d))
+end
+
+local bytearray_to_net16 = function(bytearray)
+    local a, b = bytearray:get_index(0), bytearray:get_index(1)
+    return a * 256 + b
 end
 
 function QueryMasterProtocol.init()
@@ -122,7 +145,7 @@ function QueryMasterClientRequest:insert(tvb, pinfo)
         return
     end
     -- decode the length
-    local message_length = bytes:get_index(0) * 256 + bytes:get_index(1)
+    local message_length = bytearray_to_net16(bytes)
     -- if packet is incomplete, save it for next packet
     if bytes:len() < message_length then
         self.previous = bytes
@@ -220,12 +243,41 @@ local SBListParseState = {
     [5] = 'FINISHED'
 }
 ]]--
+local KeyType = {
+    BYTE = 1,
+    UINT16 = 2,
+    STRING = 0
+}
+local KeyTypeToString = (function() 
+    local t = {}
+    for k, v in pairs(KeyType) do
+        t[v] = k:lower()
+    end
+    return t
+end)()
+
+local ResponseType = {
+    PUSH_KEYS_MESSAGE = 1,
+    PUSH_SERVER_MESSAGE = 2,
+    KEEPALIVE_MESSAGE = 3,
+    DELETE_SERVER_MESSAGE = 4,
+    MAPLOOP_MESSAGE = 5,
+    PLAYERSEARCH_MESSAGE = 6,
+}
+local ResponseTypeToString = (function() 
+    local t = {}
+    for k, v in pairs(ResponseType) do
+        t[v] = k
+    end
+end)()
 
 function QueryMasterServerResponse:new()
     local o = {
         parse_state = 'CRYPT_HEADER',
         unparsed = ByteArray.new(),
-        packets = {}
+        packets = {},
+        keys = {},
+        popular_values = {},
     }
     setmetatable(o, self)
     self.__index = self
@@ -259,12 +311,13 @@ function QueryMasterServerResponse:insert(tvb, pinfo)
                     key = key,
                     value = value,
                     kind = kind,
-                    action = 'add'
                 })
             end,
             store_raw = function(self, bytes, count)
                 self.raw = self.raw .. bytes:subset(0, count)
-            end
+            end,
+            servers = {},
+            ad_hoc_data = {}
         }
     end
     local current = self.packets[pinfo.number]
@@ -290,6 +343,15 @@ function QueryMasterServerResponse:insert(tvb, pinfo)
         self:handle_unique_value_list(current)
     elseif self.parse_state == 'SERVERS' then
         self:handle_servers(current)
+    elseif self.parse_state == 'FINISHED' then
+        self:handle_ad_hoc_data(current)
+    end
+
+    if next(current.servers) then
+        current.info = 'QueryMasterResponse ServerList'
+    end
+    if next(current.ad_hoc_data) then
+        current.info = current.info .. '& QueryMaster AdHocData'
     end
 end
 
@@ -348,7 +410,7 @@ function QueryMasterServerResponse:handle_fixed_header(current)
         return
     end
     local ip = bytearray_to_ip(self.unparsed)
-    local port = self.unparsed:get_index(4) * 256 + self.unparsed:get_index(5)
+    local port = bytearray_to_net16(self.unparsed:subset(4, 2))
     if port == 0xFFFF then
         current.info = 'QueryMaster Error'
         -- error: try get error string
@@ -404,9 +466,13 @@ function QueryMasterServerResponse:handle_key_list(current)
         current:store_raw(self.unparsed, 1 + key_name:len() + 1)
         self:advance_unparsed_buffer(1 + key_name:len() + 1)
         self.expected_elements = self.expected_elements - 1
-        local key_abbr = ('key_0x%X'):format(key_type)
-        local key_label = ('Key 0x%X'):format(key_type)
-        current:push_data(key_abbr, key_label, key_name, 'string')
+        local type_as_string = KeyTypeToString[key_type] or '<INVALID>'
+        local description = ('%s => %s'):format(key_name, type_as_string)
+        current:push_data('declared_field', 'Declared field', description, 'string')
+        table.insert(self.keys, {
+            key_type = key_type,
+            key_name = key_name,
+        })
     end
     -- continue parsing
     self.expected_elements = nil
@@ -434,6 +500,7 @@ function QueryMasterServerResponse:handle_unique_value_list(current)
         self:advance_unparsed_buffer(value_name:len() + 1)
         self.expected_elements = self.expected_elements - 1
         current:push_data('unique_value', 'Unique Value', value, 'string')
+        table.insert(self.popular_values, value)
     end
     -- continue parsing
     self.parse_state = 'SERVERS'
@@ -441,11 +508,227 @@ function QueryMasterServerResponse:handle_unique_value_list(current)
 end
 
 function QueryMasterServerResponse:handle_servers(current)
-    -- todo: implement parse server
-    current:store_raw(self.unparsed, self.unparsed:len())
-    local data = self.unparsed:raw()
-    self:advance_unparsed_buffer(data:len())
-    current:push_data('server_raw', 'Server Raw data', data, 'string')
+    local size_modifiers = {
+        PRIVATE_IP_FLAG = { value = 2, size_modifier = 4 },
+        ICMP_IP_FLAG = { value = 8, size_modifier = 4 },
+        NON_STANDARD_PORT_FLAG = { value = 16, size_modifier = 2 },
+        NON_STANDARD_PRIVATE_PORT_FLAG = { value = 32, size_modifier = 2 },
+    }
+    while self.unparsed:len() > 0 do
+        local flag = self.unparsed:get_index(0)
+        local length = 5
+        local flag_values = {
+            non_standard_port = false,
+            private_ip = false,
+            non_standard_private_port = false,
+            icmp_ip = false,
+        }
+        for k, v in pairs(size_modifiers) do
+            if bit.band(flag, v.value) ~= 0 then
+                length = length + v.size_modifier
+                local flag_name = k:match('^(.*)_FLAG$'):lower()
+                flag_values[flag_name] = true
+            end
+        end
+        if self.unparsed:len() < length then
+            -- no enough data
+            return
+        end
+        -- check if finished
+        local LAST_SERVER_MARKER = ByteArray.new('FFFFFFFF')
+        if self.unparsed:subset(1, 4) == LAST_SERVER_MARKER then
+            -- finished!
+            current:store_raw(self.unparsed, 5)
+            self:advance_unparsed_buffer(5)
+            self.parse_state = 'FINISHED'
+            return
+        end
+        -- start parsing
+        local local_parse_context = {
+            -- parameters
+            use_popular_values = true,
+            -- flag values
+            flag = flag,
+            flag_values = flag_values,
+            -- parse buffer
+            parsed_length = 1,
+            unparsed = self.unparsed:subset(1, self.unparsed:len() - 1),
+            advance_unparsed = function(self, length)
+                local remained_length = self.unparsed:len() - length
+                if remained_length > 0 then
+                    self.unparsed = self.unparsed:subset(length, remained_length)
+                elseif remained_length == 0 then
+                    self.unparsed = ByteArray.new()
+                else
+                    throw_error('QueryMasterServerResponse advance_unparsed out of range')
+                end
+                self.parsed_length = self.parsed_length + length
+            end,
+            -- parsed data
+            fields = {},
+            push_data = function(self, abbr, key, value, kind)
+                local field = {
+                    abbr = abbr,
+                    key = key,
+                    value = value,
+                    kind = kind,
+                }
+                table.insert(self.fields, field)
+            end,
+        }
+        local_parse_context:push_data('flag', 'Flag', ('%02X'):format(flag), 'uint8')
+        -- parse server ip port
+        local public_ip = bytearray_to_ip(local_parse_context.unparsed)
+        local_parse_context:push_data('public_ip', 'Public IP', public_ip, 'ipv4')
+        local_parse_context:advance_unparsed(4)
+        if flag_values.non_standard_port then
+            local public_port = bytearray_to_net16(local_parse_context.unparsed)
+            local_parse_context:push_data('public_port', 'Public Port', public_port, 'uint16')
+            local_parse_context:advance_unparsed(2)
+        end
+        -- parse server body
+        local server = self:parse_server_body(local_parse_context)
+        if not server then
+            -- need more data
+            return
+        end
+        -- store parsed data for this server
+        table.insert(current.servers, local_parse_context.fields)
+        -- store parsed raw data
+        current:store_raw(self.unparsed, local_parse_context.parsed_length)
+        -- consume parsed length
+        self:advance_unparsed_buffer(local_parse_context.parsed_length)
+    end
+end
+
+function QueryMasterServerResponse:handle_ad_hoc_data(current)
+    -- process as long as there is enough data
+    while self.unparsed:len() >= 3 do
+        local length = bytearray_to_net16(self.unparsed)
+        if self.unparsed:len() < length then
+            -- no enough data
+            return
+        end
+        local message_type = ResponseTypeToString[self.unparsed:get_index(2)]
+            or '<INVALID>'
+        local rawhex = self.unparsed:subset(0, length):tohex()
+        table.insert(current.ad_hoc_data, {
+            abbr = 'message_type',
+            key = 'Message Type',
+            value = message_type,
+            kind = 'byte',
+        })
+        table.insert(current.ad_hoc_data, {
+            abbr = 'raw',
+            key = 'Raw',
+            value = rawhex,
+            kind = 'string',
+        })
+        -- store raw data
+        current:store_raw(self.unparsed, length)
+        -- consume parsed length
+        self:advance_unparsed_buffer(length)
+        -- TODO: handle ad hoc data
+    end
+end
+
+function QueryMasterServerResponse:parse_server_body(context)
+    if type(context.use_popular_values) ~= 'boolean' then
+        throw_error('QueryMasterServerResponse parse_server_body: '
+            .. 'use_popular_values must be boolean')
+    end
+    -- parse private ip and port
+    if context.flag_values.private_ip then
+        local private_ip = bytearray_to_ip(context.unparsed)
+        context:push_data('private_ip', 'Private IP', private_ip, 'ipv4')
+        context:advance_unparsed(4)
+    end
+    if context.flag_values.non_standard_private_port then
+        local private_port = bytearray_to_net16(context.unparsed)
+        context:push_data('private_port', 'Private Port', private_port, 'uint16')
+        context:advance_unparsed(2)
+    end
+    -- parse icmp ip
+    if context.flag_values.icmp_ip then
+        local icmp_ip = bytearray_to_ip(context.unparsed)
+        context:push_data('icmp_ip', 'ICMP IP', icmp_ip, 'ipv4')
+        context:advance_unparsed(4)
+    end
+    -- parse keys
+    local HAS_KEYS_FLAG = 64
+    if bit.band(context.flag, HAS_KEYS_FLAG) ~= 0 then
+        for i, key in ipairs(self.keys) do
+            local type_name = KeyTypeToString[key.key_type]
+            if key.key_type == KeyType.BYTE then
+                if context.unparsed:len() < 1 then
+                    -- need more data
+                    return nil
+                end
+                local value = context.unparsed:get_index(0)
+                context:push_data(key.key_name, key.key_name, value, type_name)
+                context:advance_unparsed(1)
+            elseif key.key_type == KeyType.UINT16 then
+                if context.unparsed:len() < 2 then
+                    -- need more data
+                    return nil
+                end
+                local value = bytearray_to_net16(context.unparsed)
+                context:push_data(key.key_name, key.key_name, value, type_name)
+                context:advance_unparsed(2)
+            elseif key.key_type == KeyType.STRING then
+                local popular_index = 0xFF
+                if context.use_popular_values then
+                    if context.unparsed:len() < 1 then
+                        -- need more data
+                        return nil
+                    end
+                    popular_index = context.unparsed:get_index(0)
+                    context:advance_unparsed(1)
+                end
+                if popular_index == 0xFF then
+                    -- null terminated string
+                    local string = context.unparsed:raw():match('^([^\0]*)\0')
+                    if string == nil then
+                        -- need more data
+                        return nil
+                    end
+                    print(('%s -> %s'):format(key.key_name, string))
+                    context:push_data(key.key_name, key.key_name, string, type_name)
+                    context:advance_unparsed(string:len() + 1)
+                else
+                    -- lua table is 1 based
+                    local string = self.popular_values[popular_index + 1]
+                    print(('%s -> (popular) %s'):format(key.key_name, string))
+                    context:push_data(key.key_name, key.key_name, string, type_name)
+                end
+            end
+        end
+    end
+    -- parse rules
+    local HAS_FULL_RULES_FLAG = 128
+    if bit.band(context.flag, HAS_FULL_RULES_FLAG) ~= 0 then
+        while context.unparsed:len() > 0 do
+            if context.unparsed:get_index(0) == 0 then
+                -- end of rules
+                context:advance_unparsed(1)
+                break
+            end
+            local rule_name = context.unparsed:raw():match('^([^\0]*)\0')
+            if rule_name == nil then
+                -- need more data
+                return nil
+            end
+            context:advance_unparsed(rule_name:len() + 1)
+            local rule_value = context.unparsed:raw():match('^([^\0]*)\0')
+            if rule_value == nil then
+                -- need more data
+                return nil
+            end
+            context:advance_unparsed(rule_value:len() + 1)
+            context:push_data(rule_name, rule_name, rule_value, 'string')
+        end
+    end
+    return true
 end
 
 function QueryMasterServerResponse:advance_unparsed_buffer(length)
