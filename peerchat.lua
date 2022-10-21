@@ -1,4 +1,5 @@
 PEERCHAT_PORT = 6667
+PEERCHAT_NEW_PORT = 16667
 RA3_GAMEKEY = "uBZwpf"
 
 PeerchatProtocol = Proto("peerchat", "Peerchat Protocol")
@@ -29,6 +30,7 @@ function PeerchatProtocol.dissector(buffer, pinfo, tree)
     pinfo.cols.protocol = PeerchatProtocol.name
 
     local is_from_server = pinfo.src_port == PEERCHAT_PORT
+        or pinfo.src_port == PEERCHAT_NEW_PORT
 
     local t = tree:add(PeerchatProtocol, buffer())
     function add_to_wireshark(bytearray)
@@ -123,3 +125,4 @@ end
 
 local tcp_port = DissectorTable.get("tcp.port")
 tcp_port:add(PEERCHAT_PORT, PeerchatProtocol)
+tcp_port:add(PEERCHAT_NEW_PORT, PeerchatProtocol)
