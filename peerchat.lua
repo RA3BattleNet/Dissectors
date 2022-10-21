@@ -62,7 +62,7 @@ function PeerchatProtocol.dissector(buffer, pinfo, tree)
     if not instance.crypted and is_from_server then
         -- :s 705 * k|=voRElmbgHtKGW xwDplfMB>^lexB<r
         local payload = buffer():string()
-        local i, j, client_key, server_key  = payload:find(":s 705 %* ([^ ]+) ([^ ]+)[\r\n]")
+        local i, j, client_key, server_key  = payload:find(":s 705 %* ([^ ]+) ([^ \r\n]+)[\r\n]")
         if server_key and client_key then
             instance.server_cipher:initialize(server_key, RA3_GAMEKEY)
             instance.client_cipher:initialize(client_key, RA3_GAMEKEY)
