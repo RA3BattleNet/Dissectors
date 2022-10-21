@@ -5,6 +5,7 @@ QueryMasterProtocol = Proto("querymaster", "QueryMaster Protocol")
 QueryMasterProtocol.fields = {}
 local querymaster_instances = {}
 local tcp_stream_field = Field.new("tcp.stream")
+local parse_state_field = ProtoField.string("querymaster.parse_state", "ParseState")
 
 local throw_error = function(what)
     error(what)
@@ -75,6 +76,11 @@ local dissector = function(buffer, pinfo, tree)
         t[message.action or 'add'](t, field, tvb_range, text)
     end
     local t = tree:add(QueryMasterProtocol, packet_tvb_range)
+    if current.is_from_server then
+        packet_tvb_range = current.raw:tvb('Raw Data')()
+        local value = ('<Parse State: %s>'):format(instance.server.parse_state)
+        t:add(parse_state_field, packet_tvb_range, value)
+    end
     for i, message in ipairs(current.data) do
         add_to_tree('querymaster', t, message)
     end
@@ -248,7 +254,7 @@ local KeyType = {
     UINT16 = 2,
     STRING = 0
 }
-local KeyTypeToString = (function() 
+local KeyTypeToString = (function()
     local t = {}
     for k, v in pairs(KeyType) do
         t[v] = k:lower()
@@ -264,7 +270,7 @@ local ResponseType = {
     MAPLOOP_MESSAGE = 5,
     PLAYERSEARCH_MESSAGE = 6,
 }
-local ResponseTypeToString = (function() 
+local ResponseTypeToString = (function()
     local t = {}
     for k, v in pairs(ResponseType) do
         t[v] = k
